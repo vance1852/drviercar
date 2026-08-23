@@ -392,6 +392,73 @@ func TestRejectBatchDropsEveryFrame(t *testing.T) {
 	}
 }
 
+func TestValidationCoversEveryFrameBeyondDefaultPage(t *testing.T) {
+	f := newLoopFixture(t, "沪AD38383", "DL-2008")
+
+	// A batch larger than the default page size (20) must still judge every
+	// frame in one validation pass. The last frame is low quality so it must be
+	// quarantined; all others are accepted and must be able to join a dataset.
+	const frameCount = domain.DefaultPageSize + 6
+	specs := make([]testsupport.FrameSpec, 0, frameCount)
+	for i := 1; i <= frameCount; i++ {
+		specs = append(specs, testsupport.FrameSpec{
+			Sequence: i,
+			Sensor:   "lidar-front",
+			Quality:  0.9,
+		})
+	}
+	specs[len(specs)-1].Quality = 0.1
+
+	batch := f.upload(t, "beyond-page", specs)
+	outcome, err := f.harness.DataLoop.ValidateBatch(f.ctx, f.actors.Admin, batch.ID)
+	if err != nil {
+		t.Fatalf("validate batch: %v", err)
+	}
+	if outcome.Accepted != frameCount-1 || outcome.Quarantined != 1 {
+		t.Fatalf("validation must cover every frame, got accepted=%d quarantined=%d",
+			outcome.Accepted, outcome.Quarantined)
+	}
+	if outcome.Batch.AcceptedCount != frameCount-1 {
+		t.Fatalf("stored accepted count must cover every frame, got %d", outcome.Batch.AcceptedCount)
+	}
+
+	detail, err := f.harness.DataLoop.DescribeBatch(f.ctx, batch.ID)
+	if err != nil {
+		t.Fatalf("describe batch: %v", err)
+	}
+	pending := 0
+	acceptedIDs := make([]int64, 0, frameCount-1)
+	for _, frame := range detail.Frames {
+		switch frame.Status {
+		case domain.FramePending:
+			pending++
+		case domain.FrameAccepted:
+			acceptedIDs = append(acceptedIDs, frame.ID)
+		}
+	}
+	if pending != 0 {
+		t.Fatalf("no frame may remain pending after validation, got %d", pending)
+	}
+	if len(acceptedIDs) != frameCount-1 {
+		t.Fatalf("expected %d accepted frames, got %d", frameCount-1, len(acceptedIDs))
+	}
+
+	dataset, err := f.harness.DataLoop.CreateDataset(f.ctx, f.actors.Admin, dataloop.CreateDatasetInput{
+		Name: "beyond-page-set", Purpose: "regression",
+	})
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	added, err := f.harness.DataLoop.AddFrames(f.ctx, f.actors.Admin, dataset.ID, acceptedIDs)
+	if err != nil {
+		t.Fatalf("add frames: %v", err)
+	}
+	if added.Applied != len(acceptedIDs) || added.Failed != 0 {
+		t.Fatalf("every accepted frame must join the dataset, got applied=%d failed=%d",
+			added.Applied, added.Failed)
+	}
+}
+
 func TestUploadRejectsForeignOperatorAndDiscardedDrive(t *testing.T) {
 	f := newLoopFixture(t, "沪AD38383", "DL-2008")
 	frames := testsupport.BuildFrames([]testsupport.FrameSpec{

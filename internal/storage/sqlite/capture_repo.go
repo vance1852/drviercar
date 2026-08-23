@@ -124,31 +124,6 @@ func (r *captureRepo) FramesByBatch(ctx context.Context, batchID int64) ([]*doma
 	return frames, nil
 }
 
-// FramesForValidation reads the frames of a batch for the quality gate. It uses
-// the standard page size so one validation pass cannot pull an unbounded number
-// of rows into memory.
-func (r *captureRepo) FramesForValidation(ctx context.Context, batchID int64) ([]*domain.CaptureFrame, error) {
-	rows, err := r.q.QueryContext(ctx,
-		`SELECT `+frameColumns+` FROM capture_frames WHERE batch_id = ?
-		 ORDER BY sequence ASC LIMIT ?`, batchID, domain.DefaultPageSize)
-	if err != nil {
-		return nil, translate(err, "frame_query_failed", "无法查询待校验采集帧")
-	}
-	defer rows.Close()
-	frames := make([]*domain.CaptureFrame, 0, domain.DefaultPageSize)
-	for rows.Next() {
-		frame, scanErr := scanFrameRows(rows)
-		if scanErr != nil {
-			return nil, scanErr
-		}
-		frames = append(frames, frame)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, translate(err, "frame_query_failed", "读取待校验采集帧失败")
-	}
-	return frames, nil
-}
-
 func (r *captureRepo) FrameByID(ctx context.Context, id int64) (*domain.CaptureFrame, error) {
 	row := r.q.QueryRowContext(ctx, `SELECT `+frameColumns+` FROM capture_frames WHERE id = ?`, id)
 	var (

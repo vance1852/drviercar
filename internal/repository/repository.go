@@ -127,7 +127,6 @@ type CaptureRepository interface {
 	UpdateBatchStatus(ctx context.Context, id int64, expectedVersion int64, status domain.BatchStatus, validatedAt *time.Time, acceptedCount int, reason string) error
 	AppendFrames(ctx context.Context, batchID int64, frames []*domain.CaptureFrame) error
 	FramesByBatch(ctx context.Context, batchID int64) ([]*domain.CaptureFrame, error)
-	FramesForValidation(ctx context.Context, batchID int64) ([]*domain.CaptureFrame, error)
 	FrameByID(ctx context.Context, id int64) (*domain.CaptureFrame, error)
 	UpdateFrameStatus(ctx context.Context, id int64, status domain.FrameStatus, reason string) error
 	ListBatches(ctx context.Context, filter CaptureFilter) ([]*domain.CaptureBatch, int, error)

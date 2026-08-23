@@ -185,14 +185,14 @@ func (s *Service) ValidateBatch(
 			return err
 		}
 
-		judged, err := tx.Captures.FramesForValidation(ctx, batch.ID)
-		if err != nil {
-			return err
-		}
+		// The quality gate must run over every frame of the batch. The frames
+		// have already been loaded above for the manifest check, so reuse that
+		// slice instead of re-querying a page-bounded subset that would leave
+		// tail frames unjudged.
 		accepted := 0
 		quarantined := 0
 		worstSeverity := 1
-		for _, frame := range judged {
+		for _, frame := range frames {
 			if frame.QualityScore >= domain.MinimumAcceptedQuality {
 				if err := tx.Captures.UpdateFrameStatus(ctx, frame.ID, domain.FrameAccepted, ""); err != nil {
 					return err
