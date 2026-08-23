@@ -450,6 +450,73 @@ func TestUnknownRouteAndMethodMismatch(t *testing.T) {
 	}
 }
 
+func TestAdministratorForceLogoutTakesEffectImmediately(t *testing.T) {
+	c := newClient(t)
+
+	// The operator has logged in from two devices, so two sessions are live for
+	// the same person — this mirrors the field incident where two sessions were
+	// reported revoked yet the device kept working.
+	secondLogin := c.do(http.MethodPost, "/api/v1/auth/login", "", map[string]any{
+		"username": "safety-lin",
+		"password": "driver-secret-1",
+	}, nil)
+	if secondLogin.status != http.StatusOK {
+		t.Fatalf("second login failed: %+v", secondLogin)
+	}
+	secondToken, _ := secondLogin.body["token"].(string)
+	if secondToken == "" {
+		t.Fatalf("the second login must issue a token: %+v", secondLogin.body)
+	}
+
+	// Prime the auth cache by authenticating both of the operator's tokens so a
+	// memoised principal is in place. Without invalidation this would keep the
+	// tokens usable for the whole cache window after revocation.
+	primeFirst := c.do(http.MethodGet, "/api/v1/auth/me", c.actors.OperatorToken, nil, nil)
+	if primeFirst.status != http.StatusOK {
+		t.Fatalf("prime operator token: %+v", primeFirst)
+	}
+	primeSecond := c.do(http.MethodGet, "/api/v1/auth/me", secondToken, nil, nil)
+	if primeSecond.status != http.StatusOK {
+		t.Fatalf("prime second token: %+v", primeSecond)
+	}
+	primeAdmin := c.do(http.MethodGet, "/api/v1/auth/me", c.actors.AdminToken, nil, nil)
+	if primeAdmin.status != http.StatusOK {
+		t.Fatalf("prime admin token: %+v", primeAdmin)
+	}
+	// A different operator's cached session must be left untouched.
+	primeOther := c.do(http.MethodGet, "/api/v1/auth/me", c.actors.SecondToken, nil, nil)
+	if primeOther.status != http.StatusOK {
+		t.Fatalf("prime other operator token: %+v", primeOther)
+	}
+
+	revoked := c.do(http.MethodPost,
+		"/api/v1/operators/"+itoa(c.actors.Operator.OperatorID)+"/session-revocations",
+		c.actors.AdminToken, nil, nil)
+	if revoked.status != http.StatusOK {
+		t.Fatalf("revoke sessions failed: %+v", revoked)
+	}
+	if revoked.body["revoked"].(float64) != 2 {
+		t.Fatalf("both sessions of the operator must be revoked, got %v", revoked.body["revoked"])
+	}
+
+	// Every previously issued token of the operator must be refused at once,
+	// even though the cache window has not elapsed.
+	if after := c.do(http.MethodGet, "/api/v1/auth/me", c.actors.OperatorToken, nil, nil); after.status != http.StatusUnauthorized {
+		t.Fatalf("the first operator token must stop working immediately, got %d", after.status)
+	}
+	if after := c.do(http.MethodGet, "/api/v1/auth/me", secondToken, nil, nil); after.status != http.StatusUnauthorized {
+		t.Fatalf("the second operator token must stop working immediately, got %d", after.status)
+	}
+	// The administrator who issued the revocation stays valid.
+	if admin := c.do(http.MethodGet, "/api/v1/auth/me", c.actors.AdminToken, nil, nil); admin.status != http.StatusOK {
+		t.Fatalf("the administrator session must stay valid, got %d", admin.status)
+	}
+	// An unrelated operator is unaffected and their cached session keeps working.
+	if other := c.do(http.MethodGet, "/api/v1/auth/me", c.actors.SecondToken, nil, nil); other.status != http.StatusOK {
+		t.Fatalf("an unrelated operator must stay valid, got %d", other.status)
+	}
+}
+
 func itoa(value int64) string {
 	return strconv.FormatInt(value, 10)
 }

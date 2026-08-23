@@ -195,6 +195,24 @@ func (c *SessionCache) Forget(token string) {
 	c.mu.Unlock()
 }
 
+// ForgetOperator drops every memoised principal belonging to operatorID. An
+// administrator revoking all sessions of an operator must take effect at once,
+// even for tokens that the cache has already resolved within its freshness
+// window; without this the revocation is invisible until each cached entry goes
+// stale.
+func (c *SessionCache) ForgetOperator(operatorID int64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	for token, entry := range c.entries {
+		if entry.principal.OperatorID == operatorID {
+			delete(c.entries, token)
+		}
+	}
+	c.mu.Unlock()
+}
+
 // Authenticate resolves the bearer token of protected routes.
 func Authenticate(
 	authenticator Authenticator,

@@ -131,5 +131,9 @@ func (rt *Router) handleRevokeSessions(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, r, err)
 		return
 	}
+	// The session store now refuses the operator's tokens, but the HTTP layer
+	// may still be serving memoised principals from the auth cache. Drop them so
+	// the revocation takes effect immediately rather than after the cache window.
+	rt.sessions.ForgetOperator(operatorID)
 	WriteJSON(w, http.StatusOK, map[string]any{"revoked": revoked})
 }
