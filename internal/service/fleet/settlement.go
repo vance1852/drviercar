@@ -144,24 +144,9 @@ func (s *Service) ApproveSettlement(
 	if err := actor.RequireRole(domain.RoleFleetAdmin); err != nil {
 		return nil, err
 	}
-	pending, err := s.store.Repos().Settlements.ByID(ctx, settlementID)
-	if err != nil {
-		return nil, err
-	}
-	// Put the approval decision on record first so that a retry of the write
-	// below cannot lose the audit entry.
-	if err := s.recorder.RecordDecision(ctx, s.store, audit.Entry{
-		OperatorID: actor.OperatorID,
-		ObjectType: "settlement",
-		ObjectID:   pending.ID,
-		Action:     "settlement.approve",
-		Detail:     audit.Detail("billable_km", pending.BillableKm, "note", note),
-	}); err != nil {
-		return nil, err
-	}
 
 	var approved *domain.Settlement
-	err = s.store.WithTx(ctx, func(ctx context.Context, tx *repository.Registry) error {
+	err := s.store.WithTx(ctx, func(ctx context.Context, tx *repository.Registry) error {
 		settlement, err := tx.Settlements.ByID(ctx, settlementID)
 		if err != nil {
 			return err
@@ -174,6 +159,18 @@ func (s *Service) ApproveSettlement(
 				"存在 %d 个未关闭关键接管，审批必须填写说明", settlement.CriticalEvents)
 		}
 		if err := tx.Settlements.Approve(ctx, settlement.ID, actor.OperatorID, note); err != nil {
+			return err
+		}
+		// Record the approval through the same transaction so a rejected
+		// approval (non-draft settlement, missing note, ...) rolls the audit
+		// entry back instead of leaving a phantom "approved" trail behind.
+		if err := s.recorder.Record(ctx, tx, audit.Entry{
+			OperatorID: actor.OperatorID,
+			ObjectType: "settlement",
+			ObjectID:   settlement.ID,
+			Action:     "settlement.approve",
+			Detail:     audit.Detail("billable_km", settlement.BillableKm, "note", note),
+		}); err != nil {
 			return err
 		}
 		refreshed, err := tx.Settlements.ByID(ctx, settlement.ID)

@@ -702,3 +702,82 @@ func TestCancelledContextStopsTheUseCase(t *testing.T) {
 		t.Fatalf("a cancelled request must not commit mileage, got %v", refreshed.CommittedKm)
 	}
 }
+
+func TestApproveSettlementLeavesNoPhantomAuditOnRejection(t *testing.T) {
+	f := newFixture(t)
+	campaign, err := f.harness.SeedCampaign(f.ctx, f.actors.Admin, "RT-1015", 400)
+	if err != nil {
+		t.Fatalf("seed campaign: %v", err)
+	}
+	vehicle, err := f.harness.SeedVehicle(f.ctx, f.actors.Admin, "沪AD21212", domain.AutonomyL4)
+	if err != nil {
+		t.Fatalf("seed vehicle: %v", err)
+	}
+	assignment := f.assignment(t, campaign.ID, vehicle.ID, "idem-audit", 200)
+	session, err := f.harness.Fleet.StartDrive(f.ctx, f.actors.Operator, assignment.ID)
+	if err != nil {
+		t.Fatalf("start drive: %v", err)
+	}
+	if _, err := f.harness.Fleet.ReportMileage(f.ctx, f.actors.Operator, fleet.MileageReport{
+		DriveID: session.ID, AutoKm: 100,
+	}); err != nil {
+		t.Fatalf("report mileage: %v", err)
+	}
+	if _, err := f.harness.Fleet.ReportTakeover(f.ctx, f.actors.Operator, fleet.TakeoverReport{
+		DriveID:     session.ID,
+		Category:    domain.TakeoverPerception,
+		Severity:    4,
+		ManualKm:    2,
+		Description: "ghost obstacle on the ramp",
+	}); err != nil {
+		t.Fatalf("report takeover: %v", err)
+	}
+	if _, err := f.harness.Fleet.CloseDrive(f.ctx, f.actors.Operator, session.ID); err != nil {
+		t.Fatalf("close drive: %v", err)
+	}
+	settlement, err := f.harness.Fleet.SettleAssignment(f.ctx, f.actors.Admin, assignment.ID)
+	if err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	// Rejection path 1: a draft with an unresolved critical takeover must
+	// require a note. No "approved" trail must survive this rejection.
+	if _, err := f.harness.Fleet.ApproveSettlement(f.ctx, f.actors.Admin, settlement.ID, ""); err == nil {
+		t.Fatal("approving with unresolved critical takeovers requires a note")
+	}
+	assertNoApproveAudit(t, f, settlement.ID)
+
+	// Real approval goes on record exactly once.
+	if _, err := f.harness.Fleet.ApproveSettlement(f.ctx, f.actors.Admin, settlement.ID, "reviewed"); err != nil {
+		t.Fatalf("approve settlement: %v", err)
+	}
+	assertApproveAuditCount(t, f, settlement.ID, 1)
+
+	// Rejection path 2: the settlement is no longer a draft. Re-approving must
+	// error and must not add a second phantom "approved" entry.
+	if _, err := f.harness.Fleet.ApproveSettlement(f.ctx, f.actors.Admin, settlement.ID, "again"); !errors.Is(err, apperr.ErrIllegalTransition) {
+		t.Fatalf("re-approving a non-draft settlement must be rejected, got %v", err)
+	}
+	assertApproveAuditCount(t, f, settlement.ID, 1)
+}
+
+func assertNoApproveAudit(t *testing.T, f *fixture, settlementID int64) {
+	t.Helper()
+	assertApproveAuditCount(t, f, settlementID, 0)
+}
+
+func assertApproveAuditCount(t *testing.T, f *fixture, settlementID int64, want int) {
+	t.Helper()
+	events, err := f.harness.Store.Repos().Audit.ByObject(f.ctx, "settlement", settlementID)
+	if err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	var got int
+	for _, event := range events {
+		if event.Action == "settlement.approve" && event.Result == domain.AuditSuccess {
+			got++
+		}
+	}
+	if got != want {
+		t.Fatalf("settlement.approve success audit count = %d, want %d (trail %+v)", got, want, events)
+	}
+}
