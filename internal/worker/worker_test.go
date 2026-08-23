@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/vance1852/drviercar/internal/domain"
+	"github.com/vance1852/drviercar/internal/logging"
 	"github.com/vance1852/drviercar/internal/repository"
 	"github.com/vance1852/drviercar/internal/service/dataloop"
 	"github.com/vance1852/drviercar/internal/service/fleet"
@@ -249,6 +252,172 @@ func TestDispatcherLoopStopsGracefully(t *testing.T) {
 	}
 	if succeeded != 3 {
 		t.Fatalf("three jobs must be recorded as succeeded, got %d", succeeded)
+	}
+}
+
+// TestRunningJobIsInterruptedOnShutdown reproduces the rolling-restart defect:
+// a handler in flight when the stop signal arrives must observe the
+// cancellation, must never be recorded as succeeded, and must be requeued so
+// the next process can claim it again.
+func TestRunningJobIsInterruptedOnShutdown(t *testing.T) {
+	harness := newHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan struct{})
+	var (
+		startOnce sync.Once
+		canceled  int32
+	)
+	// First invocation blocks until the stop signal cancels its context, the
+	// way a long-running mileage summary would. Subsequent invocations (after
+	// the job is requeued) succeed.
+	harness.Dispatcher.Register("fleet_mileage_summary", func(jobCtx context.Context, _ *repository.Job) error {
+		startOnce.Do(func() { close(started) })
+		if atomic.LoadInt32(&canceled) == 0 {
+			<-jobCtx.Done()
+			atomic.StoreInt32(&canceled, 1)
+			return jobCtx.Err()
+		}
+		return nil
+	})
+	id, err := harness.Dispatcher.Enqueue(ctx, "fleet_mileage_summary", "{}", 3, testsupport.Anchor)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := harness.Dispatcher.RunOnce(ctx)
+		runDone <- err
+	}()
+	<-started
+	// The stop signal is delivered while the handler is still running, exactly as
+	// a SIGTERM caught during a rolling restart.
+	cancel()
+	if err := <-runDone; err != nil {
+		t.Fatalf("run once: %v", err)
+	}
+	job, err := harness.Store.Repos().Jobs.ByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if job.Status == repository.JobSucceeded {
+		t.Fatal("an interrupted job must never be recorded as succeeded")
+	}
+	if job.Status != repository.JobQueued {
+		t.Fatalf("an interrupted job must be requeued, got %s", job.Status)
+	}
+	if job.Attempts != 0 {
+		t.Fatalf("an interrupted job must not consume an attempt, got %d", job.Attempts)
+	}
+	if job.LastError == "" {
+		t.Fatal("an interrupted job must record why it was interrupted")
+	}
+
+	// The requeued job must be claimable again on the next run.
+	processed, err := harness.Dispatcher.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("reclaim run: %v", err)
+	}
+	if processed != 1 {
+		t.Fatalf("the requeued job must be claimed again, processed %d", processed)
+	}
+	job, err = harness.Store.Repos().Jobs.ByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("read job after reclaim: %v", err)
+	}
+	if job.Status != repository.JobSucceeded {
+		t.Fatalf("the requeued job must succeed on the next run, got %s", job.Status)
+	}
+}
+
+// TestHandlerReturningNilDuringShutdownIsStillInterrupted guards against a
+// handler that ignores the stop signal and reports success: the dispatcher must
+// still return the job to the queue because the process is going away.
+func TestHandlerReturningNilDuringShutdownIsStillInterrupted(t *testing.T) {
+	harness := newHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan struct{})
+	harness.Dispatcher.Register("oblivious", func(ctx context.Context, _ *repository.Job) error {
+		close(started)
+		<-ctx.Done()
+		// The handler ignores the cancellation and claims it finished.
+		return nil
+	})
+	id, err := harness.Dispatcher.Enqueue(ctx, "oblivious", "{}", 3, testsupport.Anchor)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := harness.Dispatcher.RunOnce(ctx)
+		runDone <- err
+	}()
+	<-started
+	cancel()
+	if err := <-runDone; err != nil {
+		t.Fatalf("run once: %v", err)
+	}
+	job, err := harness.Store.Repos().Jobs.ByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if job.Status != repository.JobQueued {
+		t.Fatalf("a handler that ignored the stop signal must still be interrupted, got %s", job.Status)
+	}
+}
+
+// TestReclaimRunningRestoresStrandedJobAfterRestart proves that a job left
+// running by an abrupt restart is picked up by the next process.
+func TestReclaimRunningRestoresStrandedJobAfterRestart(t *testing.T) {
+	harness := newHarness(t)
+	ctx := context.Background()
+	if _, err := harness.Dispatcher.Enqueue(ctx, "fleet_mileage_summary", "{}", 3, testsupport.Anchor); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	// Simulate a process that claimed the job and then died before booking it.
+	if _, err := harness.Store.Repos().Jobs.ClaimDue(ctx, harness.Clock.Now(), 1); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := harness.Reopen(); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	// A fresh dispatcher reclaims stranded jobs when it starts.
+	harness.Dispatcher = worker.NewDispatcher(harness.Store, harness.Clock,
+		logging.New(io.Discard, logging.LevelError), worker.Config{
+			Interval: 10 * time.Millisecond, BatchSize: 4,
+			BaseBackoff: time.Second, MaxBackoff: time.Minute,
+		})
+	var (
+		ranMu sync.Mutex
+		ran   bool
+	)
+	harness.Dispatcher.Register("fleet_mileage_summary", func(context.Context, *repository.Job) error {
+		ranMu.Lock()
+		ran = true
+		ranMu.Unlock()
+		return nil
+	})
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+	harness.Dispatcher.Start(runCtx)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		ranMu.Lock()
+		done := ran
+		ranMu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	harness.Dispatcher.Stop()
+	ranMu.Lock()
+	ranResult := ran
+	ranMu.Unlock()
+	if !ranResult {
+		t.Fatal("the stranded job must be reclaimed and run after a restart")
 	}
 }
 

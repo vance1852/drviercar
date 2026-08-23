@@ -441,6 +441,94 @@ func TestJobQueueClaimIsExclusiveAndRetryable(t *testing.T) {
 	}
 }
 
+func TestInterruptedJobIsRequeuedWithoutConsumingAnAttempt(t *testing.T) {
+	store := openStore(t)
+	ctx := context.Background()
+	now := clock.System{}.Now()
+	id, err := store.Repos().Jobs.Enqueue(ctx, &repository.Job{
+		Kind: "fleet_mileage_summary", Payload: `{}`,
+		MaxAttempts: 2, NextRunAt: now.Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	claimed, err := store.Repos().Jobs.ClaimDue(ctx, now, 5)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != id || claimed[0].Attempts != 1 {
+		t.Fatalf("expected one claimed job with attempt 1, got %+v", claimed)
+	}
+	if err := store.Repos().Jobs.MarkInterrupted(ctx, id, now, "interrupted by shutdown"); err != nil {
+		t.Fatalf("mark interrupted: %v", err)
+	}
+	job, err := store.Repos().Jobs.ByID(ctx, id)
+	if err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if job.Status != repository.JobQueued {
+		t.Fatalf("an interrupted job must return to the queue, got %s", job.Status)
+	}
+	if job.Attempts != 0 {
+		t.Fatalf("an interrupted job must not consume an attempt, got %d", job.Attempts)
+	}
+	if !job.NextRunAt.Before(now.Add(time.Second)) {
+		t.Fatalf("an interrupted job must be due again immediately, got %v", job.NextRunAt)
+	}
+	reclaimed, err := store.Repos().Jobs.ClaimDue(ctx, now.Add(time.Minute), 5)
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if len(reclaimed) != 1 || reclaimed[0].ID != id {
+		t.Fatalf("an interrupted job must be claimable again, got %+v", reclaimed)
+	}
+}
+
+func TestReclaimRunningRecoversStrandedJobsAtStartup(t *testing.T) {
+	store := openStore(t)
+	ctx := context.Background()
+	now := clock.System{}.Now()
+	runningID, err := store.Repos().Jobs.Enqueue(ctx, &repository.Job{
+		Kind: "fleet_mileage_summary", Payload: `{}`,
+		MaxAttempts: 3, NextRunAt: now.Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if _, err := store.Repos().Jobs.ClaimDue(ctx, now, 5); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	queuedID, err := store.Repos().Jobs.Enqueue(ctx, &repository.Job{
+		Kind: "purge_expired_sessions", Payload: `{}`,
+		MaxAttempts: 3, NextRunAt: now.Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("enqueue second: %v", err)
+	}
+
+	reclaimed, err := store.Repos().Jobs.ReclaimRunning(ctx, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("reclaim running: %v", err)
+	}
+	if reclaimed != 1 {
+		t.Fatalf("only the stranded running job must be reclaimed, got %d", reclaimed)
+	}
+	stranded, err := store.Repos().Jobs.ByID(ctx, runningID)
+	if err != nil {
+		t.Fatalf("read stranded job: %v", err)
+	}
+	if stranded.Status != repository.JobQueued || stranded.Attempts != 0 {
+		t.Fatalf("the stranded job must be requeued without its attempt, got %+v", stranded)
+	}
+	untouched, err := store.Repos().Jobs.ByID(ctx, queuedID)
+	if err != nil {
+		t.Fatalf("read queued job: %v", err)
+	}
+	if untouched.Status != repository.JobQueued || untouched.Attempts != 0 {
+		t.Fatalf("an already queued job must be left alone, got %+v", untouched)
+	}
+}
+
 func TestRepositoryReturnsIsolatedValues(t *testing.T) {
 	store := openStore(t)
 	vehicle := seedVehicle(t, store, "沪AD00003")

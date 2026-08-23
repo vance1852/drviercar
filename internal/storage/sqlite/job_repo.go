@@ -159,6 +159,45 @@ func (r *jobRepo) MarkDead(ctx context.Context, id int64, lastError string) erro
 	return affectedOne(result, "job_not_running", "后台任务不在执行状态")
 }
 
+// MarkInterrupted returns a running job to the queue so the next process can
+// claim it again. nextRunAt is when the requeued job becomes due. It does not
+// consume an attempt: claiming had already incremented attempts and the
+// interruption undoes that bump so a job that is only ever interrupted never
+// exhausts its retry budget.
+func (r *jobRepo) MarkInterrupted(ctx context.Context, id int64, nextRunAt time.Time, lastError string) error {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE worker_jobs
+		SET status = ?, next_run_at = ?, last_error = ?,
+			attempts = MAX(attempts - 1, 0), version = version + 1, updated_at = ?
+		WHERE id = ? AND status = ?`,
+		repository.JobQueued, toUnix(nextRunAt), lastError, nowMicro(), id, repository.JobRunning)
+	if err != nil {
+		return translate(err, "job_interrupt_failed", "无法重新排队被中断的任务")
+	}
+	return affectedOne(result, "job_not_running", "后台任务不在执行状态")
+}
+
+// ReclaimRunning moves every job still marked running back to the queue. It is
+// called at startup to recover from a process that was stopped while a job was
+// in flight, regardless of whether the bookkeeping had a chance to run.
+func (r *jobRepo) ReclaimRunning(ctx context.Context, now time.Time) (int, error) {
+	result, err := r.q.ExecContext(ctx, `
+		UPDATE worker_jobs
+		SET status = ?, next_run_at = ?, last_error = ?,
+			attempts = MAX(attempts - 1, 0), version = version + 1, updated_at = ?
+		WHERE status = ?`,
+		repository.JobQueued, toUnix(now), "interrupted by shutdown", nowMicro(),
+		repository.JobRunning)
+	if err != nil {
+		return 0, translate(err, "job_reclaim_failed", "无法回收执行中的任务")
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, apperr.Wrap(err, apperr.KindInternal, "job_reclaim_failed", "无法确认回收结果")
+	}
+	return int(affected), nil
+}
+
 func (r *jobRepo) CountByStatus(ctx context.Context, status string) (int, error) {
 	var total int
 	err := r.q.QueryRowContext(ctx,

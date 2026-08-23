@@ -223,6 +223,17 @@ type JobRepository interface {
 	MarkSucceeded(ctx context.Context, id int64) error
 	MarkRetry(ctx context.Context, id int64, nextRunAt time.Time, lastError string) error
 	MarkDead(ctx context.Context, id int64, lastError string) error
+	// MarkInterrupted returns a running job to the queue so the next process can
+	// claim it again. nextRunAt is when the requeued job becomes due. It does
+	// not consume an attempt: claiming had already incremented attempts and the
+	// interruption undoes that bump so a job that is only ever interrupted never
+	// exhausts its retry budget.
+	MarkInterrupted(ctx context.Context, id int64, nextRunAt time.Time, lastError string) error
+	// ReclaimRunning moves every job still marked running back to the queue.
+	// It is called at startup to recover from a process that was stopped while
+	// a job was in flight, regardless of whether the bookkeeping had a chance
+	// to run.
+	ReclaimRunning(ctx context.Context, now time.Time) (int, error)
 	CountByStatus(ctx context.Context, status string) (int, error)
 }
 

@@ -151,6 +151,11 @@ func (d *Dispatcher) countProcessed(succeeded, retried, dead int) {
 
 // RunOnce claims and runs at most one batch of due jobs. It returns the number
 // of jobs that were processed.
+//
+// ctx carries the stop signal so that a handler in flight when the process is
+// asked to shut down observes the cancellation and can abort. The bookkeeping
+// that records the outcome always runs on a detached context, so the outcome of
+// a claimed job is committed even while the process is winding down.
 func (d *Dispatcher) RunOnce(ctx context.Context) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -182,18 +187,49 @@ func (d *Dispatcher) RunOnce(ctx context.Context) (int, error) {
 }
 
 func (d *Dispatcher) runJob(ctx context.Context, job *repository.Job) error {
+	// bookCtx drops the stop signal so that the outcome of an already claimed
+	// job is always committed, even when the process is shutting down. The job
+	// is already in the running state: leaving it unbooked would strand it, so
+	// the bookkeeping must not fail together with the stop signal.
+	bookCtx := context.WithoutCancel(ctx)
+	bookkeep := func(fn func(tx *repository.Registry) error) error {
+		return d.store.WithTx(bookCtx, func(ctx context.Context, tx *repository.Registry) error {
+			return fn(tx)
+		})
+	}
 	handler, ok := d.handlerFor(job.Kind)
 	if !ok {
 		d.countProcessed(0, 0, 1)
-		return d.store.WithTx(ctx, func(ctx context.Context, tx *repository.Registry) error {
-			return tx.Jobs.MarkDead(ctx, job.ID, "no handler registered for kind "+job.Kind)
+		return bookkeep(func(tx *repository.Registry) error {
+			return tx.Jobs.MarkDead(bookCtx, job.ID, "no handler registered for kind "+job.Kind)
 		})
 	}
 	runErr := handler(ctx, job)
+	// If the stop signal arrived while the handler was running, the job did not
+	// really finish: it must be returned to the queue so the next process can
+	// claim it again. This takes precedence over both success and failure so a
+	// partially done job is never recorded as succeeded.
+	if ctx.Err() != nil {
+		d.countProcessed(0, 0, 0)
+		cause := runErr
+		if cause == nil {
+			cause = ctx.Err()
+		}
+		d.logger.Warn(ctx, "job interrupted by shutdown", map[string]any{
+			"job_id":   job.ID,
+			"kind":     job.Kind,
+			"attempts": job.Attempts,
+			"error":    cause.Error(),
+		})
+		return bookkeep(func(tx *repository.Registry) error {
+			return tx.Jobs.MarkInterrupted(bookCtx, job.ID, d.clock.Now(),
+				"interrupted by shutdown: "+cause.Error())
+		})
+	}
 	if runErr == nil {
 		d.countProcessed(1, 0, 0)
-		return d.store.WithTx(ctx, func(ctx context.Context, tx *repository.Registry) error {
-			return tx.Jobs.MarkSucceeded(ctx, job.ID)
+		return bookkeep(func(tx *repository.Registry) error {
+			return tx.Jobs.MarkSucceeded(bookCtx, job.ID)
 		})
 	}
 	permanent := errors.Is(runErr, ErrPermanent) || job.Attempts >= job.MaxAttempts
@@ -205,8 +241,8 @@ func (d *Dispatcher) runJob(ctx context.Context, job *repository.Job) error {
 			"attempts": job.Attempts,
 			"error":    runErr.Error(),
 		})
-		return d.store.WithTx(ctx, func(ctx context.Context, tx *repository.Registry) error {
-			return tx.Jobs.MarkDead(ctx, job.ID, runErr.Error())
+		return bookkeep(func(tx *repository.Registry) error {
+			return tx.Jobs.MarkDead(bookCtx, job.ID, runErr.Error())
 		})
 	}
 	delay := Backoff(job.Attempts, d.config.BaseBackoff, d.config.MaxBackoff)
@@ -217,8 +253,8 @@ func (d *Dispatcher) runJob(ctx context.Context, job *repository.Job) error {
 		"attempts": job.Attempts,
 		"delay_ms": delay.Milliseconds(),
 	})
-	return d.store.WithTx(ctx, func(ctx context.Context, tx *repository.Registry) error {
-		return tx.Jobs.MarkRetry(ctx, job.ID, d.clock.Now().Add(delay), runErr.Error())
+	return bookkeep(func(tx *repository.Registry) error {
+		return tx.Jobs.MarkRetry(bookCtx, job.ID, d.clock.Now().Add(delay), runErr.Error())
 	})
 }
 
@@ -240,16 +276,21 @@ func Backoff(attempt int, base, max time.Duration) time.Duration {
 	return delay
 }
 
-// Start runs the dispatcher loop until ctx is cancelled.
+// Start runs the dispatcher loop until ctx is cancelled. Before the loop starts
+// it reclaims any job that a previous process left in the running state, which
+// is how a job stranded by an abrupt restart becomes claimable again.
 func (d *Dispatcher) Start(ctx context.Context) {
 	d.wg.Add(1)
 	go func() {
 		defer d.wg.Done()
+		if reclaimed, err := d.store.Repos().Jobs.ReclaimRunning(ctx, d.clock.Now()); err != nil {
+			d.logger.Error(ctx, "job reclaim failed", map[string]any{"error": err.Error()})
+		} else if reclaimed > 0 {
+			d.logger.Info(ctx, "reclaimed jobs left running by a previous process",
+				map[string]any{"count": reclaimed})
+		}
 		ticker := time.NewTicker(d.config.Interval)
 		defer ticker.Stop()
-		// Keep the values carried by ctx but drop its cancellation, so that the
-		// bookkeeping of an already claimed job always has a usable context.
-		runCtx := context.WithoutCancel(ctx)
 		for {
 			select {
 			case <-ctx.Done():
@@ -257,7 +298,11 @@ func (d *Dispatcher) Start(ctx context.Context) {
 			case <-d.done:
 				return
 			case <-ticker.C:
-				if _, err := d.RunOnce(runCtx); err != nil {
+				// ctx carries the stop signal so a handler in flight when the
+				// process is asked to shut down observes the cancellation. The
+				// bookkeeping inside RunOnce detaches the cancellation so the
+				// outcome of a claimed job is still committed.
+				if _, err := d.RunOnce(ctx); err != nil {
 					if errors.Is(err, context.Canceled) || apperr.KindOf(err) == apperr.KindCancelled {
 						return
 					}
