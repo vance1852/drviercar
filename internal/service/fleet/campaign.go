@@ -173,31 +173,27 @@ func (s *Service) ensureCampaignGuards(
 	return nil
 }
 
+// ensureAllSettlementsApproved enforces that every completed shift of the
+// campaign has an approved settlement before the campaign may be closed.
+//
+// The check is a single count query against the assignments rather than a
+// read of the completed assignments bounded by a page size: counting in SQL
+// keeps the guard correct for campaigns that hold more completed shifts than
+// one result page, where a paginated read would silently drop the trailing
+// shifts and miss an unapproved settlement among them.
 func (s *Service) ensureAllSettlementsApproved(
 	ctx context.Context,
 	tx *repository.Registry,
 	campaignID int64,
 ) error {
-	assignments, err := tx.Assignments.CompletedByCampaign(ctx, campaignID, domain.DefaultPageSize)
+	pending, err := tx.Settlements.CountNotApprovedByCampaign(ctx, campaignID)
 	if err != nil {
 		return err
 	}
-	settlements, err := tx.Settlements.ByCampaign(ctx, campaignID)
-	if err != nil {
-		return err
-	}
-	approved := map[int64]bool{}
-	for _, settlement := range settlements {
-		if settlement.Status == domain.SettlementApproved {
-			approved[settlement.AssignmentID] = true
-		}
-	}
-	for _, assignment := range assignments {
-		if !approved[assignment.ID] {
-			return apperr.Wrap(apperr.ErrPreconditionUnmet, apperr.KindPrecondition,
-				"campaign_settlement_pending",
-				"排班 %d 的结算尚未审批，无法关闭路测计划", assignment.ID)
-		}
+	if pending > 0 {
+		return apperr.Wrap(apperr.ErrPreconditionUnmet, apperr.KindPrecondition,
+			"campaign_settlement_pending",
+			"路测计划仍有 %d 个已完成排班的结算未审批，无法关闭", pending)
 	}
 	return nil
 }

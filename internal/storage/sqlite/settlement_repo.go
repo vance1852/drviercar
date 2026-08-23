@@ -81,6 +81,32 @@ func (r *settlementRepo) ByCampaign(ctx context.Context, campaignID int64) ([]*d
 	return settlements, nil
 }
 
+// CountNotApprovedByCampaign reports how many completed shifts of a campaign
+// still lack an approved settlement.
+//
+// A shift counts as unapproved when its assignment is completed but it has no
+// settlement row whose status is approved: either no settlement was computed
+// yet, or the settlement is still a draft or has been rejected. Counting at
+// the assignment level (rather than over the bounded list of completed
+// assignments) keeps the close guard correct for campaigns that hold more
+// completed shifts than one result page, where a paginated read would drop the
+// trailing shifts and miss an unapproved settlement among them.
+func (r *settlementRepo) CountNotApprovedByCampaign(ctx context.Context, campaignID int64) (int, error) {
+	var total int
+	err := r.q.QueryRowContext(ctx, `
+		SELECT COUNT(1)
+		FROM assignments AS a
+		LEFT JOIN settlements AS s
+			ON s.assignment_id = a.id AND s.status = ?
+		WHERE a.campaign_id = ? AND a.status = ? AND s.id IS NULL`,
+		string(domain.SettlementApproved), campaignID, string(domain.AssignmentCompleted)).
+		Scan(&total)
+	if err != nil {
+		return 0, translate(err, "settlement_count_failed", "无法统计未审批结算")
+	}
+	return total, nil
+}
+
 func (r *settlementRepo) SumBillableKm(ctx context.Context, campaignID int64) (float64, error) {
 	var total sql.NullFloat64
 	err := r.q.QueryRowContext(ctx,

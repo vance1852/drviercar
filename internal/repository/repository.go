@@ -109,6 +109,12 @@ type SettlementRepository interface {
 	ByAssignment(ctx context.Context, assignmentID int64) (*domain.Settlement, error)
 	Approve(ctx context.Context, id int64, approvedBy int64, note string) error
 	ByCampaign(ctx context.Context, campaignID int64) ([]*domain.Settlement, error)
+	// CountNotApprovedByCampaign reports how many completed shifts of a
+	// campaign still lack an approved settlement. It counts assignments whose
+	// status is completed but that have no settlement in the approved state,
+	// so it is unaffected by list pagination and is the guard used when a
+	// campaign is about to be closed.
+	CountNotApprovedByCampaign(ctx context.Context, campaignID int64) (int, error)
 	SumBillableKm(ctx context.Context, campaignID int64) (float64, error)
 }
 

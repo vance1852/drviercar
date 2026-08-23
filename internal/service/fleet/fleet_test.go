@@ -3,6 +3,7 @@ package fleet_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -478,6 +479,113 @@ func TestCampaignCloseRequiresSettledShifts(t *testing.T) {
 	}
 	if summary.ApprovedCount != 1 || summary.ApprovedKm != 60 {
 		t.Fatalf("unexpected settlement summary %+v", summary)
+	}
+}
+
+// TestCampaignCloseBlocksWhenTrailingSettlementUnapproved reproduces the
+// settlement-check failure that appeared once a campaign held more completed
+// shifts than one result page. The close guard used to read only the first
+// page of completed assignments, so a trailing shift whose settlement was
+// still unapproved slipped through and the campaign was closed even though
+// mileage had not entered the settlement pipeline.
+func TestCampaignCloseBlocksWhenTrailingSettlementUnapproved(t *testing.T) {
+	f := newFixture(t)
+	// Twenty-one completed shifts exceed domain.DefaultPageSize (20). The
+	// guard must inspect the trailing shift, not only the first page.
+	const shiftCount = 21
+	campaign, err := f.harness.SeedCampaign(f.ctx, f.actors.Admin, "RT-1099", float64(shiftCount*10))
+	if err != nil {
+		t.Fatalf("seed campaign: %v", err)
+	}
+	vehicle, err := f.harness.SeedVehicle(f.ctx, f.actors.Admin, "沪AD90909", domain.AutonomyL4)
+	if err != nil {
+		t.Fatalf("seed vehicle: %v", err)
+	}
+	if _, err := f.harness.Fleet.TransitionCampaign(f.ctx, f.actors.Admin, campaign.ID,
+		domain.CampaignRunning, "fleet is on road"); err != nil {
+		t.Fatalf("start campaign: %v", err)
+	}
+
+	var settlementIDs []int64
+	for i := 0; i < shiftCount; i++ {
+		// Advance the frozen clock past the previous window so each shift is
+		// startable and the windows never overlap; 21 windows of three hours
+		// stay inside the campaign's 72-hour window.
+		base := f.harness.Clock.Now()
+		assignment, err := f.harness.Fleet.CreateAssignment(f.ctx, f.actors.Admin, fleet.CreateAssignmentInput{
+			CampaignID:     campaign.ID,
+			VehicleID:      vehicle.ID,
+			OperatorID:     f.actors.Operator.OperatorID,
+			PlannedKm:      8,
+			ShiftStart:     base,
+			ShiftEnd:       base.Add(2 * time.Hour),
+			Route:          "jiading-ring-loop",
+			IdempotencyKey: fmt.Sprintf("trailing-%d", i),
+		})
+		if err != nil {
+			t.Fatalf("create assignment %d: %v", i, err)
+		}
+		session, err := f.harness.Fleet.StartDrive(f.ctx, f.actors.Operator, assignment.ID)
+		if err != nil {
+			t.Fatalf("start drive %d: %v", i, err)
+		}
+		if _, err := f.harness.Fleet.ReportMileage(f.ctx, f.actors.Operator, fleet.MileageReport{
+			DriveID: session.ID, AutoKm: 5,
+		}); err != nil {
+			t.Fatalf("report mileage %d: %v", i, err)
+		}
+		if _, err := f.harness.Fleet.CloseDrive(f.ctx, f.actors.Operator, session.ID); err != nil {
+			t.Fatalf("close drive %d: %v", i, err)
+		}
+		settlement, err := f.harness.Fleet.SettleAssignment(f.ctx, f.actors.Admin, assignment.ID)
+		if err != nil {
+			t.Fatalf("settle assignment %d: %v", i, err)
+		}
+		settlementIDs = append(settlementIDs, settlement.ID)
+		f.harness.Clock.Advance(3 * time.Hour)
+	}
+
+	if _, err := f.harness.Fleet.TransitionCampaign(f.ctx, f.actors.Admin, campaign.ID,
+		domain.CampaignSettling, "all shifts done"); err != nil {
+		t.Fatalf("enter settlement: %v", err)
+	}
+
+	// Approve every settlement except the last, i.e. the trailing shift that a
+	// page-bounded guard would never inspect.
+	for i, id := range settlementIDs {
+		if i == len(settlementIDs)-1 {
+			continue
+		}
+		if _, err := f.harness.Fleet.ApproveSettlement(f.ctx, f.actors.Admin, id, "ok"); err != nil {
+			t.Fatalf("approve settlement %d: %v", i, err)
+		}
+	}
+
+	if _, err := f.harness.Fleet.TransitionCampaign(f.ctx, f.actors.Admin, campaign.ID,
+		domain.CampaignClosed, "closing"); err == nil {
+		t.Fatal("closing must be blocked while the trailing shift settlement is unapproved")
+	}
+	// The campaign must stay in settlement, not silently flip to closed.
+	refreshed, err := f.harness.Fleet.GetCampaign(f.ctx, campaign.ID)
+	if err != nil {
+		t.Fatalf("read campaign: %v", err)
+	}
+	if refreshed.Status != domain.CampaignSettling {
+		t.Fatalf("the campaign must stay settling, got %s", string(refreshed.Status))
+	}
+
+	// Once the trailing settlement is approved the campaign may close.
+	if _, err := f.harness.Fleet.ApproveSettlement(f.ctx, f.actors.Admin,
+		settlementIDs[len(settlementIDs)-1], "ok"); err != nil {
+		t.Fatalf("approve trailing settlement: %v", err)
+	}
+	closed, err := f.harness.Fleet.TransitionCampaign(f.ctx, f.actors.Admin, campaign.ID,
+		domain.CampaignClosed, "week closed")
+	if err != nil {
+		t.Fatalf("close campaign: %v", err)
+	}
+	if closed.Status != domain.CampaignClosed || closed.ClosedAt == nil {
+		t.Fatalf("the campaign must be closed with a timestamp, got %+v", closed)
 	}
 }
 
