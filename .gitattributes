@@ -1,0 +1,2 @@
+# Keep every file byte-identical between the working tree and the object store.
+* -text

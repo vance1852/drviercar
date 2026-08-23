@@ -1,0 +1,8 @@
+bin/
+data/*.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal
+.env
+*.out
+*.test
+*.exe
