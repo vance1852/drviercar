@@ -47,13 +47,14 @@ func (m *Maintenance) RegisterAll(dispatcher *Dispatcher) {
 	dispatcher.Register(KindArchiveBatch, m.ArchiveBatch)
 }
 
-// PurgeSessions reclaims the session rows that are no longer in use. Sessions are
-// selected by their last activity, which also catches operators who closed the
-// console without logging out.
+// PurgeSessions reclaims the session rows whose validity window has already
+// elapsed. Sessions that are still within their expiry must keep working — an
+// idle-but-valid session stays usable until expires_at truly passes — so only
+// rows past expires_at are removed, never rows selected by last activity.
 func (m *Maintenance) PurgeSessions(ctx context.Context, _ *repository.Job) error {
 	cutoff := m.Clock.Now()
 	return m.Store.WithTx(ctx, func(ctx context.Context, tx *repository.Registry) error {
-		_, err := tx.Sessions.DeleteIdle(ctx, cutoff)
+		_, err := tx.Sessions.DeleteExpired(ctx, cutoff)
 		return err
 	})
 }

@@ -280,6 +280,38 @@ func TestMaintenancePurgesSessionsAndKeys(t *testing.T) {
 	}
 }
 
+// TestMaintenancePurgeKeepsSessionsWithinTTL guards against the regression
+// where the purge job deleted every session by last activity instead of by
+// expiry. A session that is idle but still within its validity window must keep
+// authenticating after the maintenance job has run.
+func TestMaintenancePurgeKeepsSessionsWithinTTL(t *testing.T) {
+	harness := newHarness(t)
+	ctx := context.Background()
+	actors, err := harness.SeedActors(ctx)
+	if err != nil {
+		t.Fatalf("seed actors: %v", err)
+	}
+	// Advance less than the 2h session TTL: the sessions are idle but valid.
+	harness.Clock.Advance(30 * time.Minute)
+	if err := harness.Maintenance.PurgeSessions(ctx, nil); err != nil {
+		t.Fatalf("purge sessions: %v", err)
+	}
+	if _, err := harness.Auth.Authenticate(ctx, actors.AdminToken); err != nil {
+		t.Fatalf("a valid admin session must survive the purge: %v", err)
+	}
+	if _, err := harness.Auth.Authenticate(ctx, actors.OperatorToken); err != nil {
+		t.Fatalf("a valid operator session must survive the purge: %v", err)
+	}
+	// Once the validity window truly elapses, the purge reclaims the rows.
+	harness.Clock.Advance(2 * time.Hour)
+	if err := harness.Maintenance.PurgeSessions(ctx, nil); err != nil {
+		t.Fatalf("purge expired sessions: %v", err)
+	}
+	if _, err := harness.Auth.Authenticate(ctx, actors.AdminToken); err == nil {
+		t.Fatal("an expired session must be purged and stop authenticating")
+	}
+}
+
 func TestArchiveBatchJobRespectsPendingTriage(t *testing.T) {
 	harness := newHarness(t)
 	ctx := context.Background()

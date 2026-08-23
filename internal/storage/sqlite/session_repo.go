@@ -88,22 +88,6 @@ func (r *sessionRepo) DeleteExpired(ctx context.Context, before time.Time) (int,
 	return int(affected), nil
 }
 
-// DeleteIdle removes the sessions that have not been used since before. It lets
-// the maintenance worker reclaim rows of operators who stopped working without
-// logging out.
-func (r *sessionRepo) DeleteIdle(ctx context.Context, before time.Time) (int, error) {
-	result, err := r.q.ExecContext(ctx,
-		`DELETE FROM sessions WHERE last_seen_at <= ?`, toUnix(before))
-	if err != nil {
-		return 0, translate(err, "session_cleanup_failed", "无法清理空闲会话")
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return 0, apperr.Wrap(err, apperr.KindInternal, "session_cleanup_failed", "无法统计清理的会话")
-	}
-	return int(affected), nil
-}
-
 func scanSession(row *sql.Row) (*domain.Session, error) {
 	var (
 		session  domain.Session

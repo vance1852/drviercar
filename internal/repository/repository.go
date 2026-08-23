@@ -26,7 +26,6 @@ type SessionRepository interface {
 	RevokeAllForOperator(ctx context.Context, operatorID int64, revokedAt time.Time) (int, error)
 	TouchLastSeen(ctx context.Context, id int64, seenAt time.Time) error
 	DeleteExpired(ctx context.Context, before time.Time) (int, error)
-	DeleteIdle(ctx context.Context, before time.Time) (int, error)
 }
 
 // CampaignFilter narrows a campaign list query.
