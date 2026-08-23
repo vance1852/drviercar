@@ -90,15 +90,16 @@ func (d *Dataset) EnsureMutable() error {
 	return nil
 }
 
-// EnsureMemberRemovable checks that a member frame may still be taken out of the
-// dataset. Withdrawing a frame is a correction rather than a content change, so
-// it stays possible until the dataset has been published.
+// EnsureMemberRemovable checks that a member frame may still be taken out of
+// the dataset. Removing a member changes the dataset content, so it is only
+// permitted while the dataset is still building. Sealing freezes the members,
+// the frame count and the seal digest together; after that the published
+// version can never be reconciled against a digest computed over different
+// members. A sealed, released or retired dataset therefore rejects removal —
+// to drop frames after sealing the dataset must be retired and a new dataset
+// curated.
 func (d *Dataset) EnsureMemberRemovable() error {
-	if d.Status == DatasetReleased || d.Status == DatasetRetired {
-		return apperr.Wrap(apperr.ErrPreconditionUnmet, apperr.KindPrecondition,
-			"dataset_not_building", "已发布的数据集不能调整成员，当前状态为 %s", string(d.Status))
-	}
-	return nil
+	return d.EnsureMutable()
 }
 
 // EnsureFrameEligible checks that a frame may join a dataset.
