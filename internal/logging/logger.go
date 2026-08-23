@@ -50,12 +50,24 @@ func RequestIDFrom(ctx context.Context) string {
 }
 
 // Logger writes one JSON object per record.
+//
+// Every logger created from the same root shares one mutex (mu) and one closed
+// flag (shared via closeState) so that concurrent goroutines writing scoped
+// children of the root serialize on a single write — otherwise per-request
+// scoped loggers would write the shared output out of order or interleave
+// partial JSON lines. The per-logger base field is private to that logger and
+// is copied by With, so a child never aliases its parent's map.
 type Logger struct {
+	mu         *sync.Mutex
+	closeState *closeState
+	out        io.Writer
+	level      Level
+	base       map[string]any
+	nowFn      func() time.Time
+}
+
+type closeState struct {
 	mu     sync.Mutex
-	out    io.Writer
-	level  Level
-	base   map[string]any
-	nowFn  func() time.Time
 	closed bool
 }
 
@@ -67,14 +79,33 @@ func New(out io.Writer, level Level) *Logger {
 	if _, ok := levelOrder[level]; !ok {
 		level = LevelInfo
 	}
-	return &Logger{out: out, level: level, base: map[string]any{}, nowFn: time.Now}
+	return &Logger{
+		mu:         &sync.Mutex{},
+		closeState: &closeState{},
+		out:        out,
+		level:      level,
+		base:       map[string]any{},
+		nowFn:      time.Now,
+	}
 }
 
 // With returns a child logger that always emits the supplied fields. The child
-// keeps the field set of its parent so that a scoped logger stays cheap to build
-// on a hot request path.
+// gets its own copy of the field set (so concurrent callers — one access-log
+// goroutine per request — never mutate one another's fields or the parent's)
+// while still sharing the root's write mutex (so concurrent writes to the
+// output stay whole-line serialized).
 func (l *Logger) With(fields map[string]any) *Logger {
-	child := &Logger{out: l.out, level: l.level, base: l.base, nowFn: l.nowFn}
+	child := &Logger{
+		mu:         l.mu,
+		closeState: l.closeState,
+		out:        l.out,
+		level:      l.level,
+		base:       make(map[string]any, len(l.base)+len(fields)),
+		nowFn:      l.nowFn,
+	}
+	for key, value := range l.base {
+		child.base[key] = value
+	}
 	for key, value := range fields {
 		child.base[key] = value
 	}
@@ -125,18 +156,19 @@ func (l *Logger) log(ctx context.Context, level Level, message string, fields ma
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.closed {
+	if l.closeState.closed {
 		return
 	}
 	_, _ = l.out.Write(append(encoded, '\n'))
 }
 
 // Close stops further writes; it is used during graceful shutdown so that late
-// goroutines cannot write into a closed file.
+// goroutines cannot write into a closed file. It marks the whole family closed
+// so scoped children created before shutdown stop writing too.
 func (l *Logger) Close() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.closed = true
+	l.closeState.mu.Lock()
+	defer l.closeState.mu.Unlock()
+	l.closeState.closed = true
 }
 
 func sanitizeKey(key string) string {
