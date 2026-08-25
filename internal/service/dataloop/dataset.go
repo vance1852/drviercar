@@ -227,6 +227,12 @@ func (s *Service) SealDataset(
 			if frameErr != nil {
 				return frameErr
 			}
+			if frame.Status != domain.FrameAccepted {
+				return apperr.Wrap(apperr.ErrPreconditionUnmet, apperr.KindPrecondition,
+					"dataset_frame_not_accepted",
+					"成员帧 %d 当前状态为 %s，不是可用状态，请将其移出数据集后再封板",
+					frame.ID, string(frame.Status))
+			}
 			batch, batchErr := tx.Captures.BatchByID(ctx, frame.BatchID)
 			if batchErr != nil {
 				return batchErr

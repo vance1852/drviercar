@@ -303,6 +303,92 @@ func TestSensorFaultDispositionDropsQuarantinedFrames(t *testing.T) {
 	}
 }
 
+func TestSealRefusesMemberFrameNotAcceptedThenSucceedsAfterRemoval(t *testing.T) {
+	f := newLoopFixture(t, "沪AD36969", "DL-2090")
+	batch := f.upload(t, "relabel-1", []testsupport.FrameSpec{
+		{Sequence: 1, Sensor: "lidar-front", Quality: 0.9},
+		{Sequence: 2, Sensor: "camera-ring", Quality: 0.85},
+	})
+	if _, err := f.harness.DataLoop.ValidateBatch(f.ctx, f.actors.Admin, batch.ID); err != nil {
+		t.Fatalf("validate batch: %v", err)
+	}
+	detail, err := f.harness.DataLoop.DescribeBatch(f.ctx, batch.ID)
+	if err != nil {
+		t.Fatalf("describe batch: %v", err)
+	}
+	if len(detail.Frames) != 2 {
+		t.Fatalf("two accepted frames expected, got %d", len(detail.Frames))
+	}
+	for _, frame := range detail.Frames {
+		if frame.Status != domain.FrameAccepted {
+			t.Fatalf("every frame must be accepted before curating, got %s", frame.Status)
+		}
+	}
+
+	dataset, err := f.harness.DataLoop.CreateDataset(f.ctx, f.actors.Admin, dataloop.CreateDatasetInput{
+		Name: "relabel-regression", Purpose: "firmware review",
+	})
+	if err != nil {
+		t.Fatalf("create dataset: %v", err)
+	}
+	ids := []int64{detail.Frames[0].ID, detail.Frames[1].ID}
+	added, err := f.harness.DataLoop.AddFrames(f.ctx, f.actors.Admin, dataset.ID, ids)
+	if err != nil {
+		t.Fatalf("add frames: %v", err)
+	}
+	if added.Applied != 2 {
+		t.Fatalf("both accepted frames must join, got %+v", added)
+	}
+
+	// Firmware review later determines that the second frame has a bad
+	// timestamp and must never be used for training, so it is relabeled
+	// quarantined even though it had already been curated into the dataset.
+	tainted := detail.Frames[1]
+	if err := f.harness.Store.Repos().Captures.UpdateFrameStatus(f.ctx,
+		tainted.ID, domain.FrameQuarantined, "timestamp drift after firmware review"); err != nil {
+		t.Fatalf("relabel member frame: %v", err)
+	}
+
+	if _, err := f.harness.DataLoop.SealDataset(f.ctx, f.actors.Admin, dataset.ID); err == nil {
+		t.Fatal("sealing a dataset whose member frame is not accepted must be refused")
+	} else if apperr.CodeOf(err) != "dataset_frame_not_accepted" {
+		t.Fatalf("unexpected error code %s", apperr.CodeOf(err))
+	}
+
+	// The dataset must remain building and without a digest, so release is
+	// still impossible.
+	stored, err := f.harness.DataLoop.GetDataset(f.ctx, dataset.ID)
+	if err != nil {
+		t.Fatalf("read dataset: %v", err)
+	}
+	if stored.Status != domain.DatasetBuilding || stored.SealDigest != "" {
+		t.Fatalf("the rejected seal must leave no digest, got %s %q", stored.Status, stored.SealDigest)
+	}
+
+	if err := f.harness.DataLoop.RemoveFrame(f.ctx, f.actors.Admin, dataset.ID, tainted.ID); err != nil {
+		t.Fatalf("remove the quarantined member: %v", err)
+	}
+
+	sealed, err := f.harness.DataLoop.SealDataset(f.ctx, f.actors.Admin, dataset.ID)
+	if err != nil {
+		t.Fatalf("seal dataset after removing the quarantined member: %v", err)
+	}
+	if sealed.Status != domain.DatasetSealed || sealed.SealDigest == "" {
+		t.Fatalf("the remaining accepted frames must seal with a digest, got %+v", sealed)
+	}
+	if sealed.FrameCount != 1 {
+		t.Fatalf("the sealed dataset must report one frame, got %d", sealed.FrameCount)
+	}
+
+	released, err := f.harness.DataLoop.ReleaseDataset(f.ctx, f.actors.Admin, dataset.ID)
+	if err != nil {
+		t.Fatalf("release dataset: %v", err)
+	}
+	if released.Status != domain.DatasetReleased {
+		t.Fatalf("the dataset must be released, got %s", released.Status)
+	}
+}
+
 func TestAddFramesReportsPerFrameEligibility(t *testing.T) {
 	f := newLoopFixture(t, "沪AD36363", "DL-2006")
 	batch := f.upload(t, "eligible-1", []testsupport.FrameSpec{
