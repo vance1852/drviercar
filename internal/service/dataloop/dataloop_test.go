@@ -2,6 +2,7 @@ package dataloop_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/vance1852/drviercar/internal/service/dataloop"
 	"github.com/vance1852/drviercar/internal/service/fleet"
 	"github.com/vance1852/drviercar/internal/testsupport"
+	"github.com/vance1852/drviercar/internal/worker"
 )
 
 type loopFixture struct {
@@ -389,6 +391,90 @@ func TestRejectBatchDropsEveryFrame(t *testing.T) {
 	}
 	if _, err := f.harness.DataLoop.ValidateBatch(f.ctx, f.actors.Admin, batch.ID); err == nil {
 		t.Fatal("a rejected batch must not be validated")
+	}
+}
+
+// TestRejectArchivedBatchKeepsFramesUntouched reproduces the operational
+// incident: a batch that has already been archived is rejected. The transition
+// is illegal so the rejection must fail, and because nothing should be voided
+// before the transition is confirmed, every archived frame must keep its status
+// and reason exactly as they were.
+func TestRejectArchivedBatchKeepsFramesUntouched(t *testing.T) {
+	f := newLoopFixture(t, "沪AD40404", "DL-2010")
+	batch := f.upload(t, "archive-reject-1", []testsupport.FrameSpec{
+		{Sequence: 1, Sensor: "lidar-front", Quality: 0.9},
+		{Sequence: 2, Sensor: "camera-ring", Quality: 0.85},
+	})
+	if _, err := f.harness.DataLoop.ValidateBatch(f.ctx, f.actors.Admin, batch.ID); err != nil {
+		t.Fatalf("validate batch: %v", err)
+	}
+
+	// Snapshot the frame states after validation so they can be compared against
+	// the post-rejection state.
+	before, err := f.harness.DataLoop.DescribeBatch(f.ctx, batch.ID)
+	if err != nil {
+		t.Fatalf("describe batch: %v", err)
+	}
+	if len(before.Frames) != 2 {
+		t.Fatalf("expected two frames, got %d", len(before.Frames))
+	}
+
+	// Move the batch into the archived state through the same worker path that
+	// the platform uses in production.
+	payload, err := json.Marshal(worker.ArchiveBatchPayload{BatchID: batch.ID})
+	if err != nil {
+		t.Fatalf("encode payload: %v", err)
+	}
+	job := &repository.Job{ID: 1, Kind: worker.KindArchiveBatch, Payload: string(payload), MaxAttempts: 3}
+	if err := f.harness.Maintenance.ArchiveBatch(f.ctx, job); err != nil {
+		t.Fatalf("archive batch: %v", err)
+	}
+	archived, err := f.harness.Store.Repos().Captures.BatchByID(f.ctx, batch.ID)
+	if err != nil {
+		t.Fatalf("read batch: %v", err)
+	}
+	if archived.Status != domain.BatchArchived {
+		t.Fatalf("the batch must be archived, got %s", archived.Status)
+	}
+
+	// Now attempt the illegal rejection. This used to void every frame before
+	// the transition check failed.
+	if _, err := f.harness.DataLoop.RejectBatch(f.ctx, f.actors.Admin, batch.ID, "late recorder complaint"); !errors.Is(err, apperr.ErrIllegalTransition) {
+		t.Fatalf("rejecting an archived batch must be refused, got %v", err)
+	}
+
+	stillArchived, err := f.harness.Store.Repos().Captures.BatchByID(f.ctx, batch.ID)
+	if err != nil {
+		t.Fatalf("read batch after reject: %v", err)
+	}
+	if stillArchived.Status != domain.BatchArchived {
+		t.Fatalf("a failed rejection must not change the batch status, got %s", stillArchived.Status)
+	}
+	if stillArchived.Version != archived.Version {
+		t.Fatalf("a failed rejection must not bump the batch version, got %d vs %d", stillArchived.Version, archived.Version)
+	}
+	if stillArchived.RejectReason != "" {
+		t.Fatalf("a failed rejection must not write a reject reason, got %q", stillArchived.RejectReason)
+	}
+
+	after, err := f.harness.DataLoop.DescribeBatch(f.ctx, batch.ID)
+	if err != nil {
+		t.Fatalf("describe batch after reject: %v", err)
+	}
+	if len(after.Frames) != len(before.Frames) {
+		t.Fatalf("a failed rejection must not change the frame count, got %d vs %d", len(after.Frames), len(before.Frames))
+	}
+	for i, frame := range after.Frames {
+		prior := before.Frames[i]
+		if frame.Status != prior.Status {
+			t.Fatalf("frame %d status must be unchanged, got %s vs %s", frame.Sequence, frame.Status, prior.Status)
+		}
+		if frame.Reason != prior.Reason {
+			t.Fatalf("frame %d reason must be unchanged, got %q vs %q", frame.Sequence, frame.Reason, prior.Reason)
+		}
+		if frame.Status == domain.FrameDropped {
+			t.Fatalf("frame %d must not have been dropped by a failed rejection", frame.Sequence)
+		}
 	}
 }
 

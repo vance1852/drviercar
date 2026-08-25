@@ -272,6 +272,12 @@ func (s *Service) ValidateBatch(
 }
 
 // RejectBatch marks an uploaded batch as unusable.
+//
+// The state transition, frame voiding and audit event all run inside one
+// transaction. The transition is validated before any frame is touched, so a
+// batch that cannot be rejected (for example one already archived) fails before
+// a single frame is dropped and rolls back to exactly its prior state. Only a
+// committed rejection voids the frames; a failed rejection never does.
 func (s *Service) RejectBatch(
 	ctx context.Context,
 	actor domain.Principal,
@@ -285,27 +291,27 @@ func (s *Service) RejectBatch(
 	if strings.TrimSpace(reason) == "" {
 		return nil, apperr.Invalidf("batch_reject_reason_required", "驳回采集批次必须填写原因")
 	}
-	pending, err := s.store.Repos().Captures.BatchByID(ctx, batchID)
-	if err != nil {
-		return nil, err
-	}
-	frames, err := s.store.Repos().Captures.FramesByBatch(ctx, pending.ID)
-	if err != nil {
-		return nil, err
-	}
-	// Void the frames first so that a retry of the status update below cannot
-	// leave usable frames behind a rejected batch.
-	if err := s.store.Repos().Captures.DropAllFrames(ctx, pending.ID, reason); err != nil {
-		return nil, err
-	}
 
 	var rejected *domain.CaptureBatch
-	err = s.store.WithTx(ctx, func(ctx context.Context, tx *repository.Registry) error {
+	err := s.store.WithTx(ctx, func(ctx context.Context, tx *repository.Registry) error {
 		batch, err := tx.Captures.BatchByID(ctx, batchID)
 		if err != nil {
 			return err
 		}
+		// Reject before touching any frame. A batch that is not allowed to move
+		// to rejected (an archived one in particular) bails out here, so the
+		// frame voiding below never runs and the transaction rolls back clean.
 		if err := batch.EnsureTransition(domain.BatchRejected); err != nil {
+			return err
+		}
+		frames, err := tx.Captures.FramesByBatch(ctx, batch.ID)
+		if err != nil {
+			return err
+		}
+		// Void the frames through the same transaction as the status update so
+		// that a rollback of one undoes the other. A failed rejection can never
+		// leave dropped frames behind.
+		if err := tx.Captures.DropAllFrames(ctx, batch.ID, reason); err != nil {
 			return err
 		}
 		if err := tx.Captures.UpdateBatchStatus(ctx, batch.ID, batch.Version,
